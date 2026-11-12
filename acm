@@ -1,0 +1,1194 @@
+#!/usr/bin/env bash
+# acm — manage OpenClaw containers with Apple's container CLI.
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly SCRIPT_NAME="acm"
+readonly CONTAINER_PORT="18789"
+
+# ---- Resolve ACM_DIR (symlink-safe) ----
+_acm_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [ -L "$source" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        [[ "$source" != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+# Separate assignment from readonly: `readonly VAR=$(cmd)` masks the command
+# substitution's exit status, defeating errexit if _acm_dir fails.
+ACM_DIR="$(_acm_dir)"
+readonly ACM_DIR
+
+# ---- Color / Output ----
+_supports_color() {
+    [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+}
+
+if _supports_color; then
+    readonly RED=$'\033[0;31m'
+    readonly GREEN=$'\033[0;32m'
+    readonly YELLOW=$'\033[0;33m'
+    readonly BLUE=$'\033[0;34m'
+    readonly CYAN=$'\033[0;36m'
+    readonly BOLD=$'\033[1m'
+    readonly DIM=$'\033[2m'
+    readonly RESET=$'\033[0m'
+else
+    readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' RESET=''
+fi
+
+_info()    { printf "${BLUE}info:${RESET} %s\n" "$*"; }
+_success() { printf "${GREEN}ok:${RESET} %s\n" "$*"; }
+_warn()    { printf "${YELLOW}warn:${RESET} %s\n" "$*" >&2; }
+_error()   { printf "${RED}error:${RESET} %s\n" "$*" >&2; }
+_die()     { _error "$@"; exit 1; }
+
+# ---- Cleanup ----
+_TMP_FILES=()
+_cleanup() {
+    if [ ${#_TMP_FILES[@]} -gt 0 ]; then
+        for f in "${_TMP_FILES[@]}"; do
+            rm -f "$f" 2>/dev/null || true
+        done
+    fi
+}
+trap _cleanup EXIT
+
+# ---- Initialization ----
+_default_conf() {
+    cat <<'CONF'
+ACM_IMAGE=ghcr.io/aaronfaby/openclaw-custom
+ACM_DEFAULT_TAG=latest
+ACM_PORT_START=18789
+ACM_CONTAINER_PREFIX=acm
+ACM_MEMORY=4g
+ACM_CPUS=4
+ACM_GATEWAY_BIND=lan
+ACM_VOLUME_HOME_SIZE=16g
+ACM_VOLUME_CONFIG_SIZE=16g
+ACM_VOLUME_WORKSPACE_SIZE=8g
+ACM_VOLUME_AUTH_SIZE=1g
+CONF
+}
+
+_ensure_init() {
+    if [ ! -f "$ACM_DIR/acm.conf" ]; then
+        _default_conf > "$ACM_DIR/acm.conf"
+        _info "Created default config at acm.conf"
+    fi
+    mkdir -p "$ACM_DIR/containers"
+    # Env files hold API keys and the gateway token — keep them private,
+    # including files created before this was enforced.
+    for f in "$ACM_DIR/containers"/*.env; do
+        [ -f "$f" ] || continue
+        chmod 600 "$f"
+    done
+}
+
+_load_config() {
+    # acm.conf is the single source of truth — wipe any inherited env vars
+    # so a stray export in the user's shell can't override the config.
+    unset ACM_IMAGE ACM_DEFAULT_TAG ACM_PORT_START ACM_CONTAINER_PREFIX \
+        ACM_MEMORY ACM_CPUS ACM_GATEWAY_BIND \
+        ACM_VOLUME_HOME_SIZE ACM_VOLUME_CONFIG_SIZE \
+        ACM_VOLUME_WORKSPACE_SIZE ACM_VOLUME_AUTH_SIZE
+
+    if [ -f "$ACM_DIR/acm.conf" ]; then
+        # shellcheck source=/dev/null
+        source "$ACM_DIR/acm.conf"
+    fi
+
+    ACM_IMAGE="${ACM_IMAGE:-ghcr.io/aaronfaby/openclaw-custom}"
+    ACM_DEFAULT_TAG="${ACM_DEFAULT_TAG:-latest}"
+    ACM_PORT_START="${ACM_PORT_START:-18789}"
+    ACM_CONTAINER_PREFIX="${ACM_CONTAINER_PREFIX:-acm}"
+    ACM_MEMORY="${ACM_MEMORY:-4g}"
+    ACM_CPUS="${ACM_CPUS:-4}"
+    ACM_GATEWAY_BIND="${ACM_GATEWAY_BIND:-lan}"
+    ACM_VOLUME_HOME_SIZE="${ACM_VOLUME_HOME_SIZE:-16g}"
+    ACM_VOLUME_CONFIG_SIZE="${ACM_VOLUME_CONFIG_SIZE:-16g}"
+    ACM_VOLUME_WORKSPACE_SIZE="${ACM_VOLUME_WORKSPACE_SIZE:-8g}"
+    ACM_VOLUME_AUTH_SIZE="${ACM_VOLUME_AUTH_SIZE:-1g}"
+}
+
+# ---- Validation ----
+_validate_name() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        _die "Container name is required."
+    fi
+    if ! [[ "$name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}[a-zA-Z0-9])?$ ]]; then
+        _die "Invalid container name '$name'. Use alphanumeric characters and hyphens (1-64 chars, must start/end with alphanumeric)."
+    fi
+}
+
+_require_container() {
+    if ! command -v container >/dev/null 2>&1; then
+        _die "Apple's container CLI is not installed. Install it from https://github.com/apple/container"
+    fi
+    # `container system status` reports the Homebrew service as unregistered
+    # even while the apiserver is answering. A successful list is the check.
+    if ! container ls -a >/dev/null 2>&1; then
+        _die "container services are not running. Start them with: container system start"
+    fi
+}
+
+_require_config() {
+    local name="$1"
+    if [ ! -f "$ACM_DIR/containers/${name}.env" ]; then
+        _die "Container '$name' not found. Run '${SCRIPT_NAME} list' to see managed containers."
+    fi
+}
+
+_validate_tag() {
+    local tag="$1"
+    if [ -z "$tag" ]; then
+        _die "Tag cannot be empty."
+    fi
+    if ! [[ "$tag" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]]; then
+        _die "Invalid tag '$tag'. Use alphanumeric characters, dots, hyphens, and underscores (max 128 chars)."
+    fi
+}
+
+_validate_size() {
+    local label="$1" size="$2"
+    if ! [[ "$size" =~ ^[0-9]+([kKmMgGtTpP][bB]?)?$ ]]; then
+        _die "Invalid ${label} '${size}'. Use a number with an optional K, M, G, T, or P suffix (for example 4g)."
+    fi
+}
+
+_validate_runtime_config() {
+    _validate_size "ACM_MEMORY" "$ACM_MEMORY"
+    if ! [[ "$ACM_CPUS" =~ ^[0-9]+$ ]] || [ "$ACM_CPUS" -lt 1 ]; then
+        _die "ACM_CPUS must be a positive integer (got '${ACM_CPUS}')."
+    fi
+    if ! [[ "$ACM_GATEWAY_BIND" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        _die "Invalid ACM_GATEWAY_BIND '${ACM_GATEWAY_BIND}'."
+    fi
+}
+
+_validate_volume_sizes() {
+    _validate_size "ACM_VOLUME_HOME_SIZE" "$ACM_VOLUME_HOME_SIZE"
+    _validate_size "ACM_VOLUME_CONFIG_SIZE" "$ACM_VOLUME_CONFIG_SIZE"
+    _validate_size "ACM_VOLUME_WORKSPACE_SIZE" "$ACM_VOLUME_WORKSPACE_SIZE"
+    _validate_size "ACM_VOLUME_AUTH_SIZE" "$ACM_VOLUME_AUTH_SIZE"
+}
+
+# ---- Env file helpers ----
+_get_port() {
+    # Echoes nothing if the line is missing — without the `|| true`, pipefail
+    # would silently kill the script on a corrupted env file. Callers that
+    # need a port must check for empty output.
+    local name="$1"
+    grep -E '^ACM_PORT=' "$ACM_DIR/containers/${name}.env" | cut -d= -f2 | tr -d '[:space:]' || true
+}
+
+# ---- Container name ----
+_container_name() {
+    echo "${ACM_CONTAINER_PREFIX}-${1}"
+}
+
+_volume_name() {
+    local name="$1" suffix="$2"
+    echo "${ACM_CONTAINER_PREFIX}-${name}-${suffix}"
+}
+
+# ---- Port helpers ----
+_next_available_port() {
+    local max_port=$((ACM_PORT_START - 1))
+    if [ -d "$ACM_DIR/containers" ]; then
+        for env_file in "$ACM_DIR/containers"/*.env; do
+            [ -f "$env_file" ] || continue
+            local file_name
+            file_name=$(basename "$env_file" .env)
+            local port
+            port=$(_get_port "$file_name")
+            if [ -n "$port" ] && [ "$port" -gt "$max_port" ] 2>/dev/null; then
+                max_port="$port"
+            fi
+        done
+    fi
+    echo $((max_port + 1))
+}
+
+_port_in_use() {
+    local port="$1" name="${2:-}"
+    if [ -d "$ACM_DIR/containers" ]; then
+        for env_file in "$ACM_DIR/containers"/*.env; do
+            [ -f "$env_file" ] || continue
+            local file_name
+            file_name=$(basename "$env_file" .env)
+            [ "$file_name" = "$name" ] && continue
+            local p
+            p=$(_get_port "$file_name")
+            if [ "$p" = "$port" ]; then
+                echo "container '$file_name'"
+                return 0
+            fi
+        done
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "another process on this host"
+            return 0
+        fi
+    elif command -v nc >/dev/null 2>&1; then
+        if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+            echo "another process on this host"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ---- Runtime facts ----
+# Apple's inspect JSON has no Go template. Prefer jq, then python3, then a
+# last-match sed scrape so start/stop still work on a bare system.
+_json_tool() {
+    if command -v jq >/dev/null 2>&1; then
+        echo jq
+    elif command -v python3 >/dev/null 2>&1; then
+        echo python3
+    else
+        echo sed
+    fi
+}
+
+_note_json_tool() {
+    if [ "$(_json_tool)" = "sed" ]; then
+        _warn "Neither jq nor python3 is installed. Status details are limited to name, port, and state."
+    fi
+}
+
+_parse_facts() {
+    local tool
+    tool="$(_json_tool)"
+    case "$tool" in
+        jq)
+            jq -r '
+                (if type == "array" then .[0] else . end) as $c |
+                if $c == null then
+                    "absent\t-\t-"
+                else
+                    [
+                        ($c.status.state // "absent"),
+                        ((($c.status.networks // [])[0].ipv4Address // "-") | split("/")[0]),
+                        ($c.status.startedDate // "-")
+                    ] | join("\t")
+                end
+            '
+            ;;
+        python3)
+            python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    sys.stdout.write("absent\t-\t-\n")
+    raise SystemExit(0)
+data = json.loads(raw)
+c = data[0] if isinstance(data, list) else data
+if not c:
+    sys.stdout.write("absent\t-\t-\n")
+    raise SystemExit(0)
+status = c.get("status") or {}
+nets = status.get("networks") or []
+ip = "-"
+if nets and isinstance(nets[0], dict):
+    ip = (nets[0].get("ipv4Address") or "-").split("/")[0] or "-"
+state = status.get("state") or "absent"
+started = status.get("startedDate") or "-"
+sys.stdout.write("%s\t%s\t%s\n" % (state, ip, started))
+'
+            ;;
+        *)
+            local json state ip started
+            json=$(cat)
+            state=$(printf '%s' "$json" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            ip=$(printf '%s' "$json" | sed -n 's/.*"ipv4Address"[[:space:]]*:[[:space:]]*"\([^"\/]*\).*/\1/p')
+            started=$(printf '%s' "$json" | sed -n 's/.*"startedDate"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            printf '%s\t%s\t%s\n' "${state:-absent}" "${ip:--}" "${started:--}"
+            ;;
+    esac
+}
+
+# Tab-separated: state, ip, started. Missing containers are "absent".
+_container_facts() {
+    local cname json
+    cname="$(_container_name "$1")"
+    if ! json=$(container inspect "$cname" 2>/dev/null); then
+        printf 'absent\t-\t-\n'
+        return 0
+    fi
+    printf '%s' "$json" | _parse_facts
+}
+
+_container_state() {
+    local facts
+    facts=$(_container_facts "$1")
+    printf '%s\n' "${facts%%$'\t'*}"
+}
+
+_container_exists() {
+    local state
+    state=$(_container_state "$1")
+    [ "$state" != "absent" ]
+}
+
+# ---- Tag resolution ----
+_effective_tag() {
+    local name="$1"
+    local tag=""
+    if [ -f "$ACM_DIR/containers/${name}.env" ]; then
+        tag=$(grep -E '^ACM_TAG=' "$ACM_DIR/containers/${name}.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
+    fi
+    echo "${tag:-$ACM_DEFAULT_TAG}"
+}
+
+# ---- Filtered env file ----
+_filtered_env_file() {
+    local name="$1"
+    local tmp
+    tmp=$(mktemp)
+    _TMP_FILES+=("$tmp")
+    grep -vE '(^#|^$|^ACM_)' "$ACM_DIR/containers/${name}.env" > "$tmp" 2>/dev/null || true
+    echo "$tmp"
+}
+
+# ---- Volumes ----
+_ensure_volume() {
+    local vol="$1" size="$2"
+    if container volume inspect "$vol" >/dev/null 2>&1; then
+        return 0
+    fi
+    container volume create -s "$size" "$vol" >/dev/null
+}
+
+_ensure_volumes() {
+    local name="$1"
+    _validate_volume_sizes
+    _ensure_volume "$(_volume_name "$name" home)" "$ACM_VOLUME_HOME_SIZE"
+    _ensure_volume "$(_volume_name "$name" config)" "$ACM_VOLUME_CONFIG_SIZE"
+    _ensure_volume "$(_volume_name "$name" workspace)" "$ACM_VOLUME_WORKSPACE_SIZE"
+    _ensure_volume "$(_volume_name "$name" auth)" "$ACM_VOLUME_AUTH_SIZE"
+}
+
+_remove_volumes() {
+    local name="$1" vol
+    for vol in \
+        "$(_volume_name "$name" home)" \
+        "$(_volume_name "$name" config)" \
+        "$(_volume_name "$name" workspace)" \
+        "$(_volume_name "$name" auth)"
+    do
+        container volume rm "$vol" >/dev/null 2>&1 || true
+    done
+}
+
+# ---- Image ----
+_image_ref() {
+    local tag="$1"
+    echo "${ACM_IMAGE}:${tag}"
+}
+
+_ensure_image() {
+    local image="$1"
+    if container image inspect "$image" >/dev/null 2>&1; then
+        return 0
+    fi
+    _info "Image '$image' not found locally, pulling..."
+    container image pull "$image" || _die "Failed to pull image '$image'."
+}
+
+# ---- container run ----
+_container_run() {
+    local name="$1"
+    local cname tag port env_file image
+    cname="$(_container_name "$name")"
+    tag="$(_effective_tag "$name")"
+    port=$(_get_port "$name")
+    [ -n "$port" ] || _die "ACM_PORT is missing from ${name}.env — re-add it (e.g. ACM_PORT=$(_next_available_port))."
+    _validate_runtime_config
+    env_file="$(_filtered_env_file "$name")"
+    image="$(_image_ref "$tag")"
+    _ensure_image "$image"
+
+    # No --restart (the CLI has none) and no --hostname (the guest hostname
+    # is the container name). --bind lan makes the published port reachable;
+    # the image command binds loopback unless told otherwise.
+    # Mounts are parent-first so each nested volume overlays the one above it.
+    if ! container run -d \
+        --name "$cname" \
+        --user node \
+        --cpus "$ACM_CPUS" \
+        --memory "$ACM_MEMORY" \
+        -p "${port}:${CONTAINER_PORT}" \
+        -v "$(_volume_name "$name" home):/home/node" \
+        -v "$(_volume_name "$name" config):/home/node/.openclaw" \
+        -v "$(_volume_name "$name" workspace):/home/node/.openclaw/workspace" \
+        -v "$(_volume_name "$name" auth):/home/node/.config/openclaw" \
+        --env-file "$env_file" \
+        "$image" \
+        node openclaw.mjs gateway --bind "$ACM_GATEWAY_BIND"; then
+        container rm -f "$cname" >/dev/null 2>&1 || true
+        _die "Failed to start container '$name'."
+    fi
+}
+
+# `container run -d` returns as soon as the VM is up. OpenClaw then exits
+# within a second or two when it has never been set up, so check once more
+# before telling the user the container is running.
+_report_launch() {
+    local name="$1" past="$2"
+    local port state
+    port=$(_get_port "$name")
+    sleep 2
+    state=$(_container_state "$name")
+    case "$state" in
+        running|starting)
+            _success "${past} container '$name' on port ${port}."
+            ;;
+        *)
+            _warn "Container '$name' is ${state} after launch. The process exited. Check: ${SCRIPT_NAME} logs $name"
+            ;;
+    esac
+}
+
+_remove_container() {
+    local name="$1"
+    local cname state
+    cname="$(_container_name "$name")"
+    state=$(_container_state "$name")
+    [ "$state" = "absent" ] && return 0
+    case "$state" in
+        stopped) ;;
+        *)
+            container stop --time 10 "$cname" >/dev/null 2>&1 || true
+            ;;
+    esac
+    local err
+    if ! err=$(container rm -f "$cname" 2>&1); then
+        _die "Failed to remove container '$name': ${err}"
+    fi
+}
+
+# ============================================================
+# Commands
+# ============================================================
+
+cmd_create() {
+    local name="" tag="" port=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tag)  tag="${2:?'--tag requires a value'}"; shift 2 ;;
+            --port) port="${2:?'--port requires a value'}"; shift 2 ;;
+            -*)     _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} create <name> [--tag TAG] [--port PORT]"
+    _validate_name "$name"
+    _require_container
+
+    if [ -f "$ACM_DIR/containers/${name}.env" ]; then
+        _die "Container '$name' already exists. Use '${SCRIPT_NAME} env $name' to edit its configuration."
+    fi
+
+    if [ -z "$port" ]; then
+        port=$(_next_available_port)
+        while _port_in_use "$port" "$name" >/dev/null; do
+            port=$((port + 1))
+            [ "$port" -le 65535 ] || _die "No free port found above ${ACM_PORT_START}."
+        done
+    else
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            _die "Port must be a number between 1 and 65535."
+        fi
+        local conflict
+        if conflict=$(_port_in_use "$port" "$name"); then
+            _die "Port $port is already in use by $conflict."
+        fi
+    fi
+
+    tag="${tag:-$ACM_DEFAULT_TAG}"
+    _validate_tag "$tag"
+    _validate_volume_sizes
+
+    local cname
+    cname="$(_container_name "$name")"
+    if container inspect "$cname" >/dev/null 2>&1; then
+        _die "A container named '$cname' already exists in container. Remove it, or choose another name."
+    fi
+
+    local gateway_token
+    gateway_token=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || true)
+    [ -n "$gateway_token" ] || _die "Failed to generate a gateway token (could not read /dev/urandom)."
+
+    # Volumes first. A failed create can be retried: existing volumes are reused
+    # and the env file is only written after they exist.
+    _ensure_volumes "$name"
+
+    cat > "$ACM_DIR/containers/${name}.env" <<EOF
+# Container configuration for: ${name}
+# Managed by ${SCRIPT_NAME} - edit with: ${SCRIPT_NAME} env ${name}
+
+# --- ACM internal (do not remove) ---
+ACM_PORT=${port}
+ACM_TAG=${tag}
+
+# --- Gateway auth (auto-generated) ---
+OPENCLAW_GATEWAY_TOKEN=${gateway_token}
+
+# --- User environment variables ---
+# ANTHROPIC_API_KEY=
+# XAI_API_KEY=
+# OPENAI_API_KEY=
+# OPENCLAW_LOG_LEVEL=debug
+EOF
+    chmod 600 "$ACM_DIR/containers/${name}.env"
+
+    _success "Created container '$name' (port ${port}, tag ${tag})"
+    _info "Next steps:"
+    _info "  1. Set API keys:  ${SCRIPT_NAME} env ${name}"
+    _info "  2. Run setup:     ${SCRIPT_NAME} setup ${name}"
+    _info "  3. Start:         ${SCRIPT_NAME} start ${name}"
+}
+
+cmd_start() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} start <name>"
+    _validate_name "$name"
+    _require_container
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+
+    case "$state" in
+        running)
+            _info "Container '$name' is already running."
+            return 0
+            ;;
+        absent) ;;
+        *)
+            _remove_container "$name"
+            ;;
+    esac
+
+    _container_run "$name"
+    _report_launch "$name" "Started"
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} stop <name>"
+    _validate_name "$name"
+    _require_container
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+    local cname
+    cname="$(_container_name "$name")"
+
+    if [ "$state" = "absent" ] || [ "$state" = "stopped" ]; then
+        _info "Container '$name' is not running."
+        return 0
+    fi
+
+    container stop --time 10 "$cname" >/dev/null
+    _success "Stopped container '$name'."
+}
+
+cmd_restart() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} restart <name>"
+    _validate_name "$name"
+    _require_container
+    _require_config "$name"
+
+    _remove_container "$name"
+    _container_run "$name"
+    _report_launch "$name" "Restarted"
+}
+
+cmd_upgrade() {
+    local names=() tag="" all=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all)  all=true; shift ;;
+            --tag)  tag="${2:?'--tag requires a value'}"; shift 2 ;;
+            -*)     _die "Unknown option: $1" ;;
+            *)      names+=("$1"); shift ;;
+        esac
+    done
+
+    _require_container
+
+    if [ -n "$tag" ]; then
+        _validate_tag "$tag"
+    fi
+
+    if $all; then
+        [ ${#names[@]} -gt 0 ] && _die "Cannot combine --all with container names."
+        for env_file in "$ACM_DIR/containers"/*.env; do
+            [ -f "$env_file" ] || continue
+            names+=("$(basename "$env_file" .env)")
+        done
+        [ ${#names[@]} -eq 0 ] && _die "No containers to upgrade. Create one with '${SCRIPT_NAME} create <name>'."
+    fi
+
+    [ ${#names[@]} -eq 0 ] && _die "Usage: ${SCRIPT_NAME} upgrade <name> [--tag TAG] or ${SCRIPT_NAME} upgrade --all"
+
+    for name in "${names[@]}"; do
+        _validate_name "$name"
+        _require_config "$name"
+    done
+
+    local pull_tags=()
+    if [ -n "$tag" ]; then
+        pull_tags+=("$tag")
+    else
+        for name in "${names[@]}"; do
+            local t
+            t="$(_effective_tag "$name")"
+            local already=false
+            for existing in "${pull_tags[@]+"${pull_tags[@]}"}"; do
+                [ "$existing" = "$t" ] && { already=true; break; }
+            done
+            $already || pull_tags+=("$t")
+        done
+    fi
+
+    for pull_tag in "${pull_tags[@]}"; do
+        local image
+        image="$(_image_ref "$pull_tag")"
+        _info "Pulling image ${image}..."
+        container image pull "$image" || _die "Failed to pull image ${image}."
+    done
+    _success "Image(s) pulled."
+
+    for name in "${names[@]}"; do
+        if [ -n "$tag" ]; then
+            local env_file="$ACM_DIR/containers/${name}.env"
+            local tmp
+            tmp=$(mktemp)
+            _TMP_FILES+=("$tmp")
+            sed "s|^ACM_TAG=.*|ACM_TAG=${tag}|" "$env_file" > "$tmp"
+            if ! grep -qE '^ACM_TAG=' "$tmp"; then
+                printf 'ACM_TAG=%s\n' "$tag" >> "$tmp"
+            fi
+            mv "$tmp" "$env_file"
+            chmod 600 "$env_file"
+        fi
+
+        local state
+        state=$(_container_state "$name")
+
+        if [ "$state" != "absent" ]; then
+            _remove_container "$name"
+        fi
+
+        local effective
+        effective=$(_effective_tag "$name")
+
+        # Only start containers that were running — don't bring up ones the
+        # user deliberately stopped (or never started).
+        if [ "$state" = "running" ]; then
+            _container_run "$name"
+            _success "Upgraded '$name' to ${ACM_IMAGE}:${effective}"
+        else
+            _success "Upgraded '$name' to ${ACM_IMAGE}:${effective} (left stopped — start with '${SCRIPT_NAME} start $name')"
+        fi
+    done
+}
+
+cmd_logs() {
+    local name="" follow=false tail="100"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow) follow=true; shift ;;
+            -n|--tail)   tail="${2:?'--tail requires a value'}"; shift 2 ;;
+            -*)          _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} logs <name> [-f] [-n LINES]"
+    _validate_name "$name"
+    _require_container
+    _require_config "$name"
+
+    if ! [[ "$tail" =~ ^[0-9]+$ ]]; then
+        _die "Line count must be a number."
+    fi
+
+    if ! _container_exists "$name"; then
+        _die "Container '$name' has not been started yet. Run '${SCRIPT_NAME} start $name' first."
+    fi
+
+    local cname
+    cname="$(_container_name "$name")"
+
+    local args=(-n "$tail")
+    $follow && args+=(--follow)
+
+    _cleanup
+    exec container logs "${args[@]}" "$cname"
+}
+
+_container_run_interactive() {
+    local name="$1"
+    shift
+    local tag image env_file
+    tag="$(_effective_tag "$name")"
+    image="$(_image_ref "$tag")"
+    env_file="$(_filtered_env_file "$name")"
+    _validate_runtime_config
+    _ensure_image "$image"
+
+    # No --name: lets container assign a unique name so concurrent
+    # setup/run invocations don't collide.
+    container run -it --rm \
+        --user node \
+        --cpus "$ACM_CPUS" \
+        --memory "$ACM_MEMORY" \
+        -v "$(_volume_name "$name" home):/home/node" \
+        -v "$(_volume_name "$name" config):/home/node/.openclaw" \
+        -v "$(_volume_name "$name" workspace):/home/node/.openclaw/workspace" \
+        -v "$(_volume_name "$name" auth):/home/node/.config/openclaw" \
+        --env-file "$env_file" \
+        "$image" \
+        "$@"
+}
+
+cmd_setup() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} setup <name>"
+    _validate_name "$name"
+    _require_container
+    _require_config "$name"
+
+    _info "Running interactive setup for '$name'..."
+    _container_run_interactive "$name" node openclaw.mjs setup
+    _success "Setup complete for '$name'. Start it with: ${SCRIPT_NAME} start $name"
+}
+
+cmd_run() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} run <name> [cmd...]"
+    _validate_name "$name"
+    shift
+    _require_container
+    _require_config "$name"
+
+    if [ $# -eq 0 ]; then
+        _container_run_interactive "$name" /bin/bash
+    else
+        _container_run_interactive "$name" "$@"
+    fi
+}
+
+cmd_cli() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} cli <name> [--raw] [cmd...]"
+    _validate_name "$name"
+    shift
+    _require_container
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+
+    if [ "$state" != "running" ]; then
+        _die "Container '$name' is not running (state: ${state}). Start it with '${SCRIPT_NAME} start $name'."
+    fi
+
+    local cname
+    cname="$(_container_name "$name")"
+
+    # -i always (keep stdin open); -t only when both stdin/stdout are TTYs,
+    # so piped input doesn't fail.
+    local -a tty_flags=(-i)
+    if [ -t 0 ] && [ -t 1 ]; then
+        tty_flags=(-i -t)
+    fi
+
+    _cleanup
+    if [ $# -eq 0 ]; then
+        if [ ! -t 0 ] || [ ! -t 1 ]; then
+            _die "Interactive shell requires a TTY. Pass a command or run from a terminal."
+        fi
+        exec container exec -i -t "$cname" /bin/bash
+    elif [ "$1" = "--raw" ]; then
+        shift
+        [ $# -eq 0 ] && _die "Usage: ${SCRIPT_NAME} cli <name> --raw <command...>"
+        exec container exec "${tty_flags[@]}" "$cname" "$@"
+    else
+        exec container exec "${tty_flags[@]}" "$cname" node openclaw.mjs "$@"
+    fi
+}
+
+_status_label() {
+    local state="$1"
+    local status_text color
+    case "$state" in
+        running)  status_text="running";     color="$GREEN" ;;
+        starting) status_text="starting";    color="$YELLOW" ;;
+        stopping) status_text="stopping";    color="$YELLOW" ;;
+        stopped)  status_text="stopped";     color="$RED" ;;
+        absent)   status_text="not created"; color="$DIM" ;;
+        *)        status_text="$state";      color="" ;;
+    esac
+    local status_str
+    status_str=$(printf "%-12s" "$status_text")
+    if [ -n "$color" ]; then
+        printf '%s%s%s' "$color" "$status_str" "$RESET"
+    else
+        printf '%s' "$status_str"
+    fi
+}
+
+cmd_status_all() {
+    local configs=()
+    local env_file name
+    for env_file in "$ACM_DIR/containers"/*.env; do
+        [ -f "$env_file" ] || continue
+        configs+=("$(basename "$env_file" .env)")
+    done
+
+    if [ ${#configs[@]} -eq 0 ]; then
+        _info "No containers managed by ${SCRIPT_NAME}. Run '${SCRIPT_NAME} create <name>' to get started."
+        return 0
+    fi
+
+    printf "\n"
+    printf "  ${BOLD}%-16s %-12s %-8s %s${RESET}\n" "NAME" "STATUS" "PORT" "IP"
+
+    for name in "${configs[@]}"; do
+        local facts state ip port status_str
+        facts=$(_container_facts "$name")
+        state=${facts%%$'\t'*}
+        local rest=${facts#*$'\t'}
+        ip=${rest%%$'\t'*}
+        [ "$state" = "absent" ] || [ "$state" = "stopped" ] && ip="-"
+        port=$(_get_port "$name")
+        status_str=$(_status_label "$state")
+        printf "  %-16s %b %-8s %s\n" "$name" "$status_str" "$port" "$ip"
+    done
+    printf "\n"
+}
+
+cmd_status() {
+    local name="${1:-}"
+    _require_container
+    _note_json_tool
+
+    if [ -z "$name" ]; then
+        cmd_status_all
+        return
+    fi
+
+    _validate_name "$name"
+    _require_config "$name"
+
+    local cname tag port facts state ip started
+    cname="$(_container_name "$name")"
+    tag=$(_effective_tag "$name")
+    port=$(_get_port "$name")
+    facts=$(_container_facts "$name")
+    state=${facts%%$'\t'*}
+    local rest=${facts#*$'\t'}
+    ip=${rest%%$'\t'*}
+    started=${rest#*$'\t'}
+
+    printf "\n"
+    printf "  ${BOLD}Container:${RESET}  %s\n" "$name"
+    printf "  ${BOLD}ID:${RESET}         %s\n" "$cname"
+    printf "  ${BOLD}Image:${RESET}      %s:%s\n" "$ACM_IMAGE" "$tag"
+    printf "  ${BOLD}Port:${RESET}       %s → %s\n" "$port" "$CONTAINER_PORT"
+    printf "  ${BOLD}Resources:${RESET}  %s CPUs, %s memory\n" "$ACM_CPUS" "$ACM_MEMORY"
+
+    case "$state" in
+        running)  printf "  ${BOLD}Status:${RESET}     ${GREEN}running${RESET}\n" ;;
+        starting) printf "  ${BOLD}Status:${RESET}     ${YELLOW}starting${RESET}\n" ;;
+        stopping) printf "  ${BOLD}Status:${RESET}     ${YELLOW}stopping${RESET}\n" ;;
+        stopped)  printf "  ${BOLD}Status:${RESET}     ${RED}stopped${RESET}\n" ;;
+        absent)   printf "  ${BOLD}Status:${RESET}     ${DIM}not created${RESET}\n" ;;
+        *)        printf "  ${BOLD}Status:${RESET}     %s\n" "$state" ;;
+    esac
+
+    if [ "$state" != "absent" ] && [ "$state" != "stopped" ]; then
+        [ -n "$ip" ] && [ "$ip" != "-" ] && printf "  ${BOLD}IP:${RESET}         %s\n" "$ip"
+        [ -n "$started" ] && [ "$started" != "-" ] && printf "  ${BOLD}Started:${RESET}    %s\n" "$started"
+    fi
+
+    printf "  ${BOLD}Volumes:${RESET}    %s\n" "$(_volume_name "$name" home)"
+    printf "              %s\n" "$(_volume_name "$name" config)"
+    printf "              %s\n" "$(_volume_name "$name" workspace)"
+    printf "              %s\n" "$(_volume_name "$name" auth)"
+    printf "\n"
+}
+
+cmd_list() {
+    _require_container
+    _note_json_tool
+
+    local configs=()
+    local env_file
+    for env_file in "$ACM_DIR/containers"/*.env; do
+        [ -f "$env_file" ] || continue
+        configs+=("$(basename "$env_file" .env)")
+    done
+
+    if [ ${#configs[@]} -eq 0 ]; then
+        _info "No containers managed by ${SCRIPT_NAME}. Run '${SCRIPT_NAME} create <name>' to get started."
+        return 0
+    fi
+
+    printf "\n"
+    printf "  ${BOLD}%-16s %-12s %-8s${RESET}\n" "NAME" "STATUS" "PORT"
+
+    local name
+    for name in "${configs[@]}"; do
+        local state port status_str
+        state=$(_container_state "$name")
+        port=$(_get_port "$name")
+        status_str=$(_status_label "$state")
+        printf "  %-16s %b %-8s\n" "$name" "$status_str" "$port"
+    done
+    printf "\n"
+}
+
+cmd_rm() {
+    local name="" volumes=false force=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --volumes) volumes=true; shift ;;
+            --force|-f) force=true; shift ;;
+            -*)        _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} rm <name> [--volumes] [--force]"
+    _validate_name "$name"
+    _require_container
+    _require_config "$name"
+
+    local state
+    state=$(_container_state "$name")
+
+    if [ "$state" != "absent" ]; then
+        case "$state" in
+            running|starting|stopping)
+                $force || _die "Container '$name' is ${state}. Stop it first or use --force."
+                ;;
+        esac
+        local cname err
+        cname="$(_container_name "$name")"
+        if [ "$state" != "stopped" ]; then
+            container stop --time 10 "$cname" >/dev/null 2>&1 || true
+        fi
+        if ! err=$(container rm -f "$cname" 2>&1); then
+            _die "Failed to remove container '$name': ${err}"
+        fi
+    fi
+
+    if $volumes; then
+        local confirm="n"
+        if $force; then
+            confirm="y"
+        elif [ -t 0 ]; then
+            printf "${YELLOW}This will permanently delete all data for '$name'. Continue? [y/N]${RESET} "
+            read -r confirm
+        else
+            _warn "Non-interactive shell: use --force to delete volumes without confirmation."
+        fi
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            _remove_volumes "$name"
+            _info "Volumes removed."
+        else
+            _info "Volumes preserved."
+        fi
+    fi
+
+    rm -f "$ACM_DIR/containers/${name}.env"
+    _success "Removed container '$name'."
+}
+
+_strip_env_quotes() {
+    # Strip a single pair of surrounding matching quotes from each KEY=value
+    # value. --env-file passes values through verbatim, so wrapping quotes
+    # end up inside the variable. Returns 0 if the file was modified.
+    local file="$1" tmp
+    tmp=$(mktemp)
+    _TMP_FILES+=("$tmp")
+    sed -E \
+        -e 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' \
+        -e "s/^([A-Za-z_][A-Za-z0-9_]*)='(.*)'\$/\1=\2/" \
+        "$file" > "$tmp"
+    if cmp -s "$tmp" "$file"; then
+        return 1
+    fi
+    mv "$tmp" "$file"
+    chmod 600 "$file"
+    return 0
+}
+
+cmd_env() {
+    local name="${1:-}"
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} env <name>"
+    _validate_name "$name"
+    _require_config "$name"
+
+    local editor="${EDITOR:-vi}"
+    # EDITOR may carry arguments (e.g. "code -w"); let it word-split.
+    # shellcheck disable=SC2086
+    $editor "$ACM_DIR/containers/${name}.env"
+
+    if _strip_env_quotes "$ACM_DIR/containers/${name}.env"; then
+        _warn "Stripped surrounding quotes from one or more values in ${name}.env (--env-file passes them through literally)."
+    fi
+    chmod 600 "$ACM_DIR/containers/${name}.env"
+
+    local state
+    state=$(_container_state "$name" 2>/dev/null) || state="absent"
+    if [ "$state" = "running" ] || [ "$state" = "starting" ]; then
+        _info "Restart the container for changes to take effect: ${SCRIPT_NAME} restart $name"
+    fi
+}
+
+cmd_pull() {
+    local tag="${1:-$ACM_DEFAULT_TAG}"
+    _validate_tag "$tag"
+    _require_container
+
+    local image
+    image="$(_image_ref "$tag")"
+    _info "Pulling ${image}..."
+    container image pull "$image" || _die "Failed to pull image."
+    _success "Image pulled: ${image}"
+
+    if [ "$tag" != "$ACM_DEFAULT_TAG" ]; then
+        if [ ! -t 0 ]; then
+            _info "Non-interactive shell: keeping default tag as '${ACM_DEFAULT_TAG}'. Edit acm.conf to change it."
+            return 0
+        fi
+        local confirm
+        printf "Set '${tag}' as the default tag? [y/N] "
+        read -r confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            local tmp
+            tmp=$(mktemp)
+            _TMP_FILES+=("$tmp")
+            sed "s|^ACM_DEFAULT_TAG=.*|ACM_DEFAULT_TAG=${tag}|" "$ACM_DIR/acm.conf" > "$tmp"
+            if ! grep -qE '^ACM_DEFAULT_TAG=' "$tmp"; then
+                printf 'ACM_DEFAULT_TAG=%s\n' "$tag" >> "$tmp"
+            fi
+            mv "$tmp" "$ACM_DIR/acm.conf"
+            _success "Default tag set to '${tag}'."
+        fi
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+${BOLD}${SCRIPT_NAME}${RESET} - Apple Container Manager v${VERSION}
+
+${BOLD}Usage:${RESET}
+  ${SCRIPT_NAME} <command> [options]
+
+${BOLD}Container Lifecycle:${RESET}
+  create <name> [--tag TAG] [--port PORT]   Create a new container configuration
+  setup <name>                              Run interactive OpenClaw setup
+  start <name>                              Start a container
+  stop <name>                               Stop a container
+  restart <name>                            Restart a container
+  rm <name> [--volumes] [--force]           Remove a container
+
+${BOLD}Management:${RESET}
+  list, ls                                  List all managed containers
+  status [name]                             Show container status
+  logs <name> [-f] [-n LINES]              View container logs
+  run <name> [cmd...]                       Run a one-off interactive container
+  cli <name> [--raw] [cmd...]              Execute commands in a running container
+  env <name>                                Edit container environment variables
+
+${BOLD}Image:${RESET}
+  pull [tag]                                Pull the latest image
+  upgrade <name> [--tag TAG]                Upgrade a container to the latest image
+  upgrade --all [--tag TAG]                 Upgrade all containers
+
+${BOLD}Other:${RESET}
+  help                                      Show this help
+  version                                   Show version
+
+${BOLD}Examples:${RESET}
+  ${SCRIPT_NAME} create main                        Create container 'main' with defaults
+  ${SCRIPT_NAME} env main                           Set API keys and environment
+  ${SCRIPT_NAME} setup main                         Run interactive OpenClaw setup
+  ${SCRIPT_NAME} start main                         Start the container
+  ${SCRIPT_NAME} cli main                           Open a shell in the container
+  ${SCRIPT_NAME} cli main configure                 Run 'openclaw configure' inside
+  ${SCRIPT_NAME} upgrade --all                      Upgrade all containers to latest
+
+Apple's container CLI does not restart containers on exit or at login.
+A stopped container stays stopped until you start it again.
+EOF
+}
+
+cmd_version() {
+    echo "${SCRIPT_NAME} v${VERSION}"
+}
+
+# ============================================================
+# Main dispatch
+# ============================================================
+
+main() {
+    _ensure_init
+    _load_config
+
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        create)            cmd_create "$@" ;;
+        setup)             cmd_setup "$@" ;;
+        start)             cmd_start "$@" ;;
+        stop)              cmd_stop "$@" ;;
+        restart)           cmd_restart "$@" ;;
+        upgrade)           cmd_upgrade "$@" ;;
+        logs)              cmd_logs "$@" ;;
+        run)               cmd_run "$@" ;;
+        cli|exec|shell)    cmd_cli "$@" ;;
+        status)            cmd_status "$@" ;;
+        list|ls)           cmd_list "$@" ;;
+        rm|remove|delete)  cmd_rm "$@" ;;
+        env)               cmd_env "$@" ;;
+        pull)              cmd_pull "$@" ;;
+        help|--help|-h)    cmd_help ;;
+        version|--version) cmd_version ;;
+        *)                 _error "Unknown command: $cmd"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
