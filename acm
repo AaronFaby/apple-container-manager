@@ -457,6 +457,123 @@ _report_launch() {
     esac
 }
 
+# Run a command and kill it if it is still going after N seconds. `container
+# stop` waits on the guest agent, which never answers when the guest is wedged.
+_run_bounded() {
+    local seconds="$1"
+    shift
+    "$@" &
+    local pid=$!
+    local i=0
+    while [ "$i" -lt "$seconds" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            local rc=0
+            wait "$pid" || rc=$?
+            return "$rc"
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
+}
+
+# Host directory for one container. The launchd job's plist lives in that
+# directory on container 1.7.1. Fall back to the default app-root layout
+# when the job is not loaded.
+_container_host_dir() {
+    local cname="$1"
+    local plist=""
+    plist=$(launchctl print "gui/$(id -u)/com.apple.container.container-runtime-linux.${cname}" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' || true)
+    plist=${plist%%$'\n'*}
+    if [ -n "$plist" ]; then
+        dirname "$plist"
+        return 0
+    fi
+    printf '%s\n' "${HOME}/Library/Application Support/com.apple.container/containers/${cname}"
+}
+
+# The guest VM is a Virtualization.VirtualMachine process, parented by
+# launchd, with this container's kernel.bin open. SIGKILL is a hard power-off.
+# It does not delete volumes.
+_kill_host_vm() {
+    local cname="$1"
+    local dir="" pids="" pid comm
+    dir=$(_container_host_dir "$cname")
+    [ -f "$dir/kernel.bin" ] || return 0
+    pids=$(lsof -t "$dir/kernel.bin" 2>/dev/null || true)
+    [ -n "$pids" ] || return 0
+    for pid in $pids; do
+        comm=$(ps -ww -p "$pid" -o command= 2>/dev/null || true)
+        case "$comm" in
+            *Virtualization.VirtualMachine*)
+                _warn "Killing host VM ${pid} for '${cname}'."
+                kill -9 "$pid" 2>/dev/null || true
+                ;;
+        esac
+    done
+}
+
+# Runtime process for this container only. The command line must name this
+# uuid; a launchd pid that fails that check is left alone.
+_kill_host_runtime() {
+    local cname="$1"
+    local pid="" args=""
+    pid=$(launchctl print "gui/$(id -u)/com.apple.container.container-runtime-linux.${cname}" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }' || true)
+    case "$pid" in
+        ''|0|-) return 0 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 0
+    args=$(ps -ww -p "$pid" -o command= 2>/dev/null || true)
+    case " ${args} " in
+        *" --uuid ${cname} "*)
+            _warn "Killing container runtime ${pid} for '${cname}'."
+            kill -9 "$pid" 2>/dev/null || true
+            ;;
+        *)
+            _die "Refusing to kill pid ${pid}: it is not the runtime for '${cname}'."
+            ;;
+    esac
+}
+
+# Power the VM off from the host, then let `container stop` record it.
+# Calling stop first hangs for as long as the guest agent is wedged.
+_force_stop() {
+    local name="$1"
+    local cname state
+    cname="$(_container_name "$name")"
+    state=$(_container_state "$name")
+    case "$state" in
+        absent|stopped) return 0 ;;
+    esac
+
+    command -v lsof >/dev/null 2>&1 || _die "stop --force needs lsof to find the host VM."
+
+    _warn "Force-stopping '${name}' (${state}). The guest is not asked to shut down."
+    _kill_host_vm "$cname"
+    _run_bounded 10 container stop --time 0 "$cname" >/dev/null 2>&1 || true
+    state=$(_container_state "$name")
+    case "$state" in
+        absent|stopped) return 0 ;;
+    esac
+
+    _kill_host_runtime "$cname"
+    _kill_host_vm "$cname"
+    _run_bounded 10 container stop --time 0 "$cname" >/dev/null 2>&1 || true
+
+    local i=0
+    while [ "$i" -lt 10 ]; do
+        state=$(_container_state "$name")
+        case "$state" in
+            absent|stopped) return 0 ;;
+        esac
+        sleep 1
+        i=$((i + 1))
+    done
+    _die "Force-stop left '${name}' in state '${state}'."
+}
+
 _remove_container() {
     local name="$1"
     local cname state
@@ -588,8 +705,20 @@ cmd_start() {
 }
 
 cmd_stop() {
-    local name="${1:-}"
-    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} stop <name>"
+    local name="" force=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            -*)         _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} stop <name> [--force]"
     _validate_name "$name"
     _require_container
     _require_config "$name"
@@ -604,17 +733,36 @@ cmd_stop() {
         return 0
     fi
 
-    container stop --time 10 "$cname" >/dev/null
+    if [ "$force" = true ]; then
+        _force_stop "$name"
+    else
+        container stop --time 10 "$cname" >/dev/null
+    fi
     _success "Stopped container '$name'."
 }
 
 cmd_restart() {
-    local name="${1:-}"
-    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} restart <name>"
+    local name="" force=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            -*)         _die "Unknown option: $1" ;;
+            *)
+                [ -z "$name" ] && name="$1" || _die "Unexpected argument: $1"
+                shift
+                ;;
+        esac
+    done
+
+    [ -z "$name" ] && _die "Usage: ${SCRIPT_NAME} restart <name> [--force]"
     _validate_name "$name"
     _require_container
     _require_config "$name"
 
+    if [ "$force" = true ]; then
+        _force_stop "$name"
+    fi
     _remove_container "$name"
     _container_run "$name"
     _report_launch "$name" "Restarted"
@@ -1120,8 +1268,8 @@ ${BOLD}Container Lifecycle:${RESET}
   create <name> [--tag TAG] [--port PORT]   Create a new container configuration
   setup <name>                              Run interactive OpenClaw setup
   start <name>                              Start a container
-  stop <name>                               Stop a container
-  restart <name>                            Restart a container
+  stop <name> [--force]                     Stop a container
+  restart <name> [--force]                  Restart a container
   rm <name> [--volumes] [--force]           Remove a container
 
 ${BOLD}Management:${RESET}
@@ -1146,6 +1294,7 @@ ${BOLD}Examples:${RESET}
   ${SCRIPT_NAME} env main                           Set API keys and environment
   ${SCRIPT_NAME} setup main                         Run interactive OpenClaw setup
   ${SCRIPT_NAME} start main                         Start the container
+  ${SCRIPT_NAME} restart main --force               Kill a wedged VM and boot it again
   ${SCRIPT_NAME} cli main                           Open a shell in the container
   ${SCRIPT_NAME} cli main configure                 Run 'openclaw configure' inside
   ${SCRIPT_NAME} upgrade --all                      Upgrade all containers to latest

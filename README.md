@@ -154,17 +154,23 @@ The image is pulled automatically when it is not local.
 
 ```bash
 acm stop <name>
+acm stop <name> --force
 ```
 
 Sends `container stop --time 10` (SIGTERM, then kill after 10 seconds). If the container is already stopped or has never been created, stop tells you and exits 0. Volumes and the env file stay.
+
+`--force` is for a guest that is no longer answering. `container stop` and `acm cli` both wait on the guest agent, so a wedged VM (the usual cause is the guest running out of memory) makes them hang past the 10 second limit. `--force` SIGKILLs the host `Virtualization.VirtualMachine` process that has this container's disk open, then records the stop. Other containers are left alone. Volumes and the env file stay. This is a hard power-off, so use it when a normal stop does not return.
 
 ### `restart`
 
 ```bash
 acm restart <name>
+acm restart <name> --force
 ```
 
 Deletes the VM if one exists, then boots a new one with the current env file, tag, and port. Same warning as start if the process exits immediately. Use this after `acm env` if the container was running.
+
+`--force` force-stops a wedged guest first, the same way `acm stop --force` does, then boots a new VM on the existing volumes. A container that is only slow is killed too. A stopped container is booted without a kill.
 
 ### `rm`
 
@@ -439,6 +445,10 @@ These are properties of `container` 1.7.1, not choices `acm` can paper over:
 To manage an existing name, set `ACM_CONTAINER_PREFIX` to the prefix those VMs and volumes already use, and add a `containers/<name>.env` whose `ACM_PORT` matches the published host port. Do this before `acm start`. Start deletes and recreates a stopped VM, and it will refuse to replace one that is running until you stop it. Volumes with the expected names are reused rather than recreated, so a matching prefix keeps the data.
 
 ## Troubleshooting
+
+**`acm stop` or `acm cli` hangs**
+
+The guest agent is not answering, so those commands wait. Run `acm restart <name> --force` to kill that container's host VM and boot a new one. `acm stop <name> --force` kills it and leaves it down. Volumes are kept either way.
 
 **`container services are not running`**
 

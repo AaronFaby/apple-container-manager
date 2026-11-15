@@ -44,10 +44,14 @@ Do not retarget this tool at Docker, Podman, or a general container manager. It 
 |---|---|---|---|---|
 | `start` | no-op | delete VM, boot | delete VM, boot | boot |
 | `stop` | `container stop --time 10` | stop | message, exit 0 | message, exit 0 |
+| `stop --force` | kill host VM, then `container stop --time 0` | same | message, exit 0 | message, exit 0 |
 | `restart` | delete, boot | delete, boot | delete, boot | boot |
+| `restart --force` | force-stop, delete, boot | force-stop, delete, boot | delete, boot | boot |
 | `rm` | refuse without `--force` | refuse without `--force` | delete VM | delete env file only |
 | `cli` | exec | refuse | refuse | refuse |
 | `upgrade` | pull, delete, boot | pull, delete, leave down | pull, leave down | pull, leave down |
+
+`stop` and `cli` talk to the guest agent. A wedged guest (seen when the 4 GiB VM runs out of memory and virtio-blk cannot allocate) never answers, so those commands hang past `--time`. `--force` does not wait on the guest. It SIGKILLs the host `Virtualization.VirtualMachine` process that has this container's `kernel.bin` open, then runs `container stop --time 0` so the runtime records the stop. The runtime's launchd label on container 1.7.1 is `com.apple.container.container-runtime-linux.<id>`. Kill that process only if stop still does not finish, and only after its command line contains `--uuid <id>` exactly. Do not kill every `VirtualMachine` on the machine. Volumes are not touched. `restart` without `--force` still uses the graceful stop inside `_remove_container`.
 
 `_report_launch` sleeps 2 seconds after `container run -d` and warns if the state is no longer `running` or `starting`. OpenClaw with no config exits in well under that, and nothing restarts it. Keep the warning. Do not treat a zero exit from `container run` alone as "the gateway is up."
 
@@ -61,7 +65,7 @@ Do not retarget this tool at Docker, Podman, or a general container manager. It 
 | Inspect one | `container inspect <id>` JSON array |
 | Run detached | `container run -d --name --user --cpus --memory -p -v --env-file <image> <cmd...>` |
 | Run interactive | `container run -it --rm` with the same volumes, user, resources, and env. No `--name`, so concurrent `setup` / `run` do not collide. No `-p`. |
-| Stop | `container stop --time 10` |
+| Stop | `container stop --time 10`. `--force` kills the host VM first, then `container stop --time 0` |
 | Remove | `container rm -f` |
 | Logs | `container logs -n <n> [-f]`. There is no `--tail`. `-n` defaults to 100. |
 | Exec | `container exec -i` always, plus `-t` only when stdin and stdout are both TTYs |
